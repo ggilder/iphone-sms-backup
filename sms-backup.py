@@ -236,6 +236,8 @@ def find_sms_db():
         path = paths[0]
     else:
         logging.warning("Multiple SMS dbs found.")
+        for path in paths:
+            logging.info(path)
         path = None
     return path
 
