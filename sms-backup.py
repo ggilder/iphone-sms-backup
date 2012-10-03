@@ -31,6 +31,13 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import io
+
+try:
+    from biplist import *
+except ImportError:
+    logging.error("biplist required. Try `sudo easy_install biplist`.")
+    sys.exit(1)
 
 from datetime import datetime
 
@@ -41,7 +48,7 @@ except NameError:
     try:
         import argparse
     except:
-        print "argparse required. Try `pip install argparse`."
+        logging.error("argparse required. Try `pip install argparse`.")
         sys.exit(1)
 
 # silence Python 2.6 buggy warnings about Exception.message
@@ -57,6 +64,21 @@ if sys.version_info[:2] == (2, 6):
 # Global variables
 ORIG_DB = 'test.db'
 COPY_DB = None
+"""
+iMessage flags:
+      36869   Sent from iPhone to SINGLE PERSON (address)
+     102405   Sent to SINGLE PERSON (text contains email, phone, or url)
+      12289   Received by iPhone
+      77825   Received (text contains email, phone, or url)
+      45061   Received (iMessage received with read receipt)
+
+See wiki page on FLAGS fields for more details.
+"""
+incoming_flags = (12289, 77825)
+outgoing_flags = (36869, 102405, 45061)
+flags_group_outgoing = (32773, 98309)
+# fix this to combine above
+flags_whitelist = incoming_flags + outgoing_flags + flags_group_outgoing
 
 def setup_and_parse(parser):
     """
@@ -287,6 +309,22 @@ def alias_map(aliases):
             amap[key] = alias.decode('utf-8')
     return amap
 
+def parse_group(row):
+    # Parse list of participants in a group chat.
+    return readPlist(io.BytesIO(str(row['participants'])))
+
+def build_group_chats_query():
+    """
+    Build query for the list of group chat rooms.
+    """
+    query = """
+SELECT
+    room_name,
+    participants
+FROM madrid_chat
+WHERE room_name != '' """
+    return query
+
 def build_msg_query(numbers, emails):
     """
     Build the query for SMS and iMessage messages.
@@ -310,9 +348,11 @@ SELECT
     text,
     flags,
     group_id,
+    madrid_type,
     madrid_handle,
     madrid_flags,
     madrid_error,
+    madrid_roomname,
     is_madrid,
     madrid_date_read,
     madrid_date_delivered
@@ -369,7 +409,7 @@ def convert_date(unix_date, format):
     ds = dt.strftime(format)
     return ds.decode('utf-8')
 
-def convert_address_imessage(row, me, alias_map):
+def convert_address_imessage(row, me, alias_map, group_chats):
     """
     Find the iMessage address in row (a sqlite3.Row) and return a tuple of
     address strings: (from_addr, to_addr).
@@ -379,29 +419,55 @@ def convert_address_imessage(row, me, alias_map):
 
     Next, look for alias in alias_map.  Otherwise, use formatted address.
 
+    If the message is part of a group message, to_addr will be a representation
+    of the group chat.
+
     Use `madrid_flags` to determine direction of the message.  (See wiki
     page for Meaning of FLAGS fields discussion.)
 
     """
-    incoming_flags = (12289, 77825)
-    outgoing_flags = (36869, 102405, 45061)
 
     if isinstance(me, str):
         me = me.decode('utf-8')
 
-    # If madrid_handle is phone number, have to truncate it.
-    email_match = re.search('@', row['madrid_handle'])
-    if email_match:
-        handle = row['madrid_handle']
-    else:
-        handle = trunc(row['madrid_handle'])
+    if row['madrid_handle']:
+        # If madrid_handle is phone number, have to truncate it.
+        email_match = re.search('@', row['madrid_handle'])
+        if email_match:
+            handle = row['madrid_handle']
+        else:
+            handle = trunc(row['madrid_handle'])
 
-    if handle in alias_map:
-        other = alias_map[handle]
-    else:
-        other = format_address(row['madrid_handle'])
+        if handle in alias_map:
+            other = alias_map[handle]
+        else:
+            other = format_address(handle)
 
-    if row['madrid_flags'] in incoming_flags:
+    # group message
+    if row['madrid_type'] == 1:
+        # construct group info
+        group = dict()
+        group['roomname'] = row['madrid_roomname']
+        participants = group_chats.get(row['madrid_roomname'], None)
+        if not participants:
+            participants = []
+            logging.warning("Unable to find participants for group chat %s on message %s" % \
+                    (row['madrid_roomname'], row['ROWID']) )
+        group['participants'] = participants
+        to_addr = group
+
+        if row['madrid_flags'] in flags_group_outgoing:
+            from_addr = me
+        else:
+            # for some reason, some messages in group chats don't have addresses
+            if row['madrid_handle']:
+                from_addr = other
+            else:
+                from_addr = 'Unknown'
+                logging.warning("Unable to determine sender for message %s" % row['ROWID'])
+
+
+    elif row['madrid_flags'] in incoming_flags:
         from_addr = other
         to_addr = me
     elif row['madrid_flags'] in outgoing_flags:
@@ -475,42 +541,20 @@ def skip_imessage(row):
     """
     Return True, if iMessage row should be skipped.
 
-    I whitelist madrid_flags values that I understand:
-
-         36869   Sent from iPhone to SINGLE PERSON (address)
-        102405   Sent to SINGLE PERSON (text contains email, phone, or url)
-         12289   Received by iPhone
-         77825   Received (text contains email, phone, or url)
-         45061   Received (iMessage received with read receipt)
-
-    Don't handle iMessage Group chats:
-
-         32773   Sent from iPhone to GROUP
-         98309   Sent to GROUP (text contains email, phone or url)
-
-    See wiki page on FLAGS fields for more details:
-
     """
-    flags_group_msgs = (32773, 98309)
-    flags_whitelist = (36869, 102405, 12289, 77825, 45061)
     retval = False
     if row['madrid_error'] != 0:
         logging.info("Skipping msg (%s) with error code %s. Address: %s. "
                         "Text: %s" % (row['rowid'], row['madrid_error'],
                         row['address'], row['text']))
         retval = True
-    elif row['madrid_flags'] in flags_group_msgs:
-        logging.info("Skipping msg (%s). Don't handle iMessage group chat. "
-                     "Text: %s" % (row['rowid'], row['text']))
-        retval = True
     elif row['madrid_flags'] not in flags_whitelist:
         logging.info("Skipping msg (%s). Don't understand madrid_flags: %s. "
                         "Text: %s" % (row['rowid'], row['madrid_flags'],
                         row['text']))
         retval = True
-    elif not row['madrid_handle']:
+    elif not row['madrid_handle'] and row['madrid_type'] != 1:
         logging.info("Skipping msg (%s) without address. "
-                        "(Probably iMessage group chat.) "
                         "Text: %s" % (row['rowid'], row['text']))
         retval = True
     elif not row['text']:
@@ -597,6 +641,11 @@ def output(messages, out_file, format, header):
 
     fh.close()
 
+def debug_row(row):
+    logging.info("Debug msg %s:" % row['ROWID'])
+    for key in row.keys():
+        logging.info("%s: %s" % (key, row[key]))
+
 def main():
         parser = argparse.ArgumentParser()
         args = setup_and_parse(parser)
@@ -617,6 +666,7 @@ def main():
         ORIG_DB = args.db_file or find_sms_db()
         COPY_DB = copy_sms_db(ORIG_DB)
         aliases = alias_map(args.aliases)
+        group_chats_query = build_group_chats_query()
         query, params = build_msg_query(args.numbers, args.emails)
         conn = None
 
@@ -625,6 +675,16 @@ def main():
             conn.row_factory = sqlite3.Row
             conn.create_function("TRUNC", 1, trunc)
             cur = conn.cursor()
+
+            # query group chats
+            cur.execute(group_chats_query, tuple([]))
+            logging.debug("Run query: %s" % (query))
+            logging.debug("With query params: %s" % (params,))
+            group_chats = dict()
+            for row in cur:
+                group_chats[row['room_name']] = parse_group(row)
+
+            # query messages
             cur.execute(query, params)
             logging.debug("Run query: %s" % (query))
             logging.debug("With query params: %s" % (params,))
@@ -634,13 +694,16 @@ def main():
                 if row['is_madrid'] == 1:
                     if skip_imessage(row): continue
                     im_date = imessage_date(row)
+                    timestamp = im_date
                     fmt_date = convert_date(im_date, args.date_format)
-                    fmt_from, fmt_to = convert_address_imessage(row, args.identity, aliases)
+                    fmt_from, fmt_to = convert_address_imessage(row, args.identity, aliases, group_chats)
                 else:
                     if skip_sms(row): continue
+                    timestamp = row['date']
                     fmt_date = convert_date(row['date'], args.date_format)
                     fmt_from, fmt_to = convert_address_sms(row, args.identity, aliases)
-                msg = {'date': fmt_date,
+                msg = {'timestamp': timestamp,
+                       'date': fmt_date,
                        'from': fmt_from,
                        'to': fmt_to,
                        'text': clean_text_msg(row['text'])}
