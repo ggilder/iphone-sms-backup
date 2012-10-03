@@ -384,7 +384,7 @@ def convert_address_imessage(row, me, alias_map):
         
     """
     incoming_flags = (12289, 77825)
-    outgoing_flags = (36869, 102405)
+    outgoing_flags = (36869, 102405, 45061)
     
     if isinstance(me, str): 
         me = me.decode('utf-8')
@@ -436,7 +436,7 @@ def convert_address_sms(row, me, alias_map):
     if row['flags'] == 2:
         from_addr = other
         to_addr = me
-    elif row['flags'] == 3:
+    elif row['flags'] in (3, 16387):
         from_addr = me
         to_addr = other
         
@@ -456,7 +456,8 @@ def clean_text_msg(txt):
 def skip_sms(row):
     """Return True, if sms row should be skipped."""
     retval = False
-    if row['flags'] not in (2, 3):
+    """16387 = iMessage sent as text message"""
+    if row['flags'] not in (2, 3, 16387):
         logging.info("Skipping msg (%s) not sent. Address: %s. Text: %s." % \
                         (row['rowid'], row['address'], row['text']))
         retval = True
@@ -480,6 +481,7 @@ def skip_imessage(row):
         102405   Sent to SINGLE PERSON (text contains email, phone, or url)
          12289   Received by iPhone
          77825   Received (text contains email, phone, or url)
+         45061   Received (iMessage received with read receipt)
     
     Don't handle iMessage Group chats:
         
@@ -490,7 +492,7 @@ def skip_imessage(row):
         
     """
     flags_group_msgs = (32773, 98309)
-    flags_whitelist = (36869, 102405, 12289, 77825)
+    flags_whitelist = (36869, 102405, 12289, 77825, 45061)
     retval = False
     if row['madrid_error'] != 0:
         logging.info("Skipping msg (%s) with error code %s. Address: %s. "
