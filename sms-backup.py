@@ -33,6 +33,14 @@ import sys
 import tempfile
 import io
 
+# objc bridge for parsing NS data structures
+import objc
+NSObject = objc.lookUpClass('NSObject')
+NSArchiver = objc.lookUpClass('NSArchiver')
+NSUnarchiver = objc.lookUpClass('NSUnarchiver')
+NSArray = objc.lookUpClass('NSArray')
+NSDictionary = objc.lookUpClass('NSDictionary')
+
 try:
     from biplist import *
 except ImportError:
@@ -60,6 +68,9 @@ if sys.version_info[:2] == (2, 6):
                                     "deprecated as of Python 2.6",
                             category=DeprecationWarning,
                             module='argparse')
+
+# import supporting files
+from lib import BackupFilesys
 
 # Global variables
 ORIG_DB = 'test.db'
@@ -355,7 +366,8 @@ SELECT
     madrid_roomname,
     is_madrid,
     madrid_date_read,
-    madrid_date_delivered
+    madrid_date_delivered,
+    madrid_attachmentInfo
 FROM message """
     # Build up the where clause, if limiting query by phone.
     params = []
@@ -563,6 +575,22 @@ def skip_imessage(row):
         retval = True
     return retval
 
+def imessage_attachment(row, filesys):
+    # return iMessage attachment info, if any.
+    if not row['madrid_attachmentInfo']:
+        return None
+
+    attachments = NSUnarchiver.unarchiveObjectWithData_(row['madrid_attachmentInfo'])
+    logging.info("ATTACHMENT(s)!")
+    logging.info(attachments)
+    # `attachments` now is an array of guids which can be referenced against
+    # the attachment_guid column in madrid_attachment table.  Get corresponding
+    # filename column from that table and then do
+    # filesys.file_for_path(filename) to get path to backup file.  Need to
+    # determine where to copy files and whether they should be renamed based on
+    # guid (flat dir structure) or try to recreate original iOS file path.
+    return True
+
 def msgs_human(messages, header):
     """
     Return messages, with optional header row.
@@ -669,6 +697,7 @@ def main():
         group_chats_query = build_group_chats_query()
         query, params = build_msg_query(args.numbers, args.emails)
         conn = None
+        filesys = BackupFilesys(os.path.dirname(ORIG_DB))
 
         try:
             conn = sqlite3.connect(COPY_DB)
@@ -697,6 +726,7 @@ def main():
                     timestamp = im_date
                     fmt_date = convert_date(im_date, args.date_format)
                     fmt_from, fmt_to = convert_address_imessage(row, args.identity, aliases, group_chats)
+                    attachment = imessage_attachment(row, filesys)
                 else:
                     if skip_sms(row): continue
                     timestamp = row['date']
